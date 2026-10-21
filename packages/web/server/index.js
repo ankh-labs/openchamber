@@ -134,6 +134,10 @@ import { permissionDefaultOf, readSpacePermissionDefault } from './lib/spaces/sp
 import { dockerHostOf } from './lib/spaces/places/ssh-host.js';
 import { SPACE_IDLE_EXIT_CODE } from './lib/spaces/layout.js';
 import { createSwitchController, registerSpaceRoutes } from './lib/spaces/routes.js';
+import { createExternalEndpointRegistry, EXTERNAL_ENDPOINT_FILE } from './lib/external-endpoints/registry.js';
+import { createExternalSessionMerge } from './lib/external-endpoints/sessions.js';
+import { registerExternalEndpointRoutes } from './lib/external-endpoints/routes.js';
+import { createExternalEventManager } from './lib/external-endpoints/events.js';
 import { configureGitEnvironment, getCheckedOutBranch, resolvePrimaryWorktreeRoot } from './lib/git/service.js';
 import { createEnvironmentStore } from './lib/environment/store.js';
 import { createEnvironmentRuntime } from './lib/environment/runtime.js';
@@ -711,6 +715,22 @@ let uiAuthController = null;
 // The isolated-spaces host: the place, the manager and the dispatcher. Null while the feature's
 // switch is off, and then nothing of the feature runs (decision 19 in the module's DOCUMENTATION.md).
 let spacesHost = null;
+// #5080 — external OpenCode endpoints: a registry and a session merge, with no
+// space, no place and no container runtime. The file is read lazily; an empty
+// or missing registry means the hook below is a pass-through.
+const externalEndpointRegistry = createExternalEndpointRegistry({
+  filePath: path.join(OPENCHAMBER_DATA_DIR, EXTERNAL_ENDPOINT_FILE),
+  allowPrivateHosts: String(process.env.OPENCHAMBER_EXTERNAL_PRIVATE_ALLOWLIST || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+  logger: console,
+});
+const externalEndpoints = createExternalSessionMerge({ registry: externalEndpointRegistry, logger: console });
+let externalEndpointEvents = null;
+void externalEndpointRegistry.load().catch((error) => {
+  console.warn(`[external-endpoints] the registry could not be read: ${error?.message ?? error}`);
+});
 let activeTunnelController = null;
 let globalWatcherStartPromise = null;
 const tunnelProviderRegistry = createTunnelProviderRegistry([
@@ -1245,6 +1265,16 @@ globalMessageStreamHub.subscribeEvent((event) => {
   }
 });
 
+// #5080 — the endpoint event fan-in shares the host hub. It is created after
+// the hub exists; the core /api/event stream needs no UI broadcast channel, so
+// the optional queue/permission state streams are not attached yet.
+externalEndpointEvents = createExternalEventManager({
+  registry: externalEndpointRegistry,
+  index: externalEndpoints.index,
+  hub: globalMessageStreamHub,
+  logger: console,
+});
+
 /**
  * Browser bridges hand us the raw v2 wire payload (they forward it untouched to
  * the client). The synthetic OpenChamber frames the UI also expects are derived
@@ -1317,7 +1347,15 @@ const serverUtilsRuntime = createServerUtilsRuntime({
   getStoredSessionMetadata: () => sessionMetadataStore.listUnmigrated(),
   // Isolated spaces: with the switch on, the session list carries every space's sessions and
   // the global SSE stream their events. Called, not captured: the host is made in `main`.
-  getMergeSpaceSessionList: () => (spacesHost ? (payload) => spacesHost.mergeSessionList(payload) : null),
+  // #5080 — external endpoints compose with the spaces merge: spaces first (if
+  // the switch is on), then the endpoints. No endpoints means the payload is
+  // returned unchanged, so this is safe with the feature unused.
+  getMergeSpaceSessionList: () => {
+    const mergeSpaces = spacesHost
+      ? (payload) => spacesHost.mergeSessionList(payload)
+      : (payload) => Promise.resolve(payload);
+    return async (payload) => externalEndpoints.merge(await mergeSpaces(payload));
+  },
   getSpaceEventHub: () => (spacesHost ? globalMessageStreamHub : null),
   fs,
   os,
@@ -2500,6 +2538,19 @@ async function main(options = {}) {
     startHost: startSpacesHost,
     persist: (enabled) => persistSettings({ isolatedSpacesEnabled: enabled }),
     persistMachine: (machine) => persistSettings({ isolatedSpacesSshHost: machine }),
+  });
+  registerExternalEndpointRoutes(app, {
+    getRegistry: () => externalEndpointRegistry,
+    getMerge: () => externalEndpoints,
+    onRegistryChanged: () => {
+      void externalEndpointEvents?.ensure().catch((error) => {
+        console.warn(`[external-endpoints] the event connections did not sync: ${error?.message ?? error}`);
+      });
+    },
+    logger: console,
+  });
+  void externalEndpointEvents?.ensure().catch((error) => {
+    console.warn(`[external-endpoints] the event connections did not start: ${error?.message ?? error}`);
   });
   registerSpaceRoutes(app, {
     getJourney: () => spacesHost?.journey ?? null,

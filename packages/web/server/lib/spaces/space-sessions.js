@@ -43,7 +43,7 @@ const isRecord = (value) => z.object({}).passthrough().safeParse(value).success;
  * host's ids, `claimedBy` names the space that already listed an id. Duplicates within the list
  * keep the first. Resolves `{ records, dropped }`, `dropped` counting each code.
  */
-export function filterSpaceSessionRecords({ spaceId, records, isHostSessionId, claimedBy }) {
+export function filterSpaceSessionRecords({ spaceId, records, isHostSessionId, claimedBy, trusted = false }) {
   const kept = [];
   const dropped = {};
   const seen = new Set();
@@ -56,7 +56,10 @@ export function filterSpaceSessionRecords({ spaceId, records, isHostSessionId, c
       continue;
     }
     const { id, location } = parsed.data;
-    if (!isDirectoryOfSpace(location.directory, spaceId)) { drop(SPACE_DROP_CODES.outsideRoot); continue; }
+    // #5080 — trusted external endpoints: the directory is the REMOTE server's
+    // path, not a path under this host's /spaces/<id>. The collision rules below
+    // stay on; only the container-root containment is skipped.
+    if (!trusted && !isDirectoryOfSpace(location.directory, spaceId)) { drop(SPACE_DROP_CODES.outsideRoot); continue; }
     if (isHostSessionId(id)) { drop(SPACE_DROP_CODES.hostId); continue; }
     const owner = claimedBy(id);
     if (owner !== null && owner !== spaceId) { drop(SPACE_DROP_CODES.claimed); continue; }
@@ -73,12 +76,13 @@ export function filterSpaceSessionRecords({ spaceId, records, isHostSessionId, c
  * Execution events carry no location and pass on their session id alone. Answers the drop
  * code, or null when the event passes.
  */
-export function spaceEventDropCode({ spaceId, payload, isHostSessionId }) {
+export function spaceEventDropCode({ spaceId, payload, isHostSessionId, trusted = false }) {
   const parsed = eventSchema.safeParse(payload);
   if (!parsed.success) return SPACE_DROP_CODES.malformed;
   const { data, location } = parsed.data;
   for (const directory of [location?.directory, data?.location?.directory]) {
     if (directory === undefined || directory === null) continue;
+    if (trusted) continue;
     if (!directorySchema.safeParse(directory).success || !isDirectoryOfSpace(directory, spaceId)) return SPACE_DROP_CODES.eventOutsideRoot;
   }
   if (data?.sessionID !== undefined && isHostSessionId(data.sessionID)) return SPACE_DROP_CODES.eventHostSession;
@@ -134,7 +138,7 @@ export function mergeSessionLists(hostPayload, spaceLists) {
  * What the host knows about sessions across the boundary: the host's own ids, and per space
  * the last list it accepted and the state of that answer. One per host process.
  */
-export function createSpaceSessionIndex({ logger = console } = {}) {
+export function createSpaceSessionIndex({ logger = console, trusted = false } = {}) {
   const hostIds = new Map();
   const spaces = new Map();
   const claims = new Map();
@@ -182,7 +186,7 @@ export function createSpaceSessionIndex({ logger = console } = {}) {
     },
     /** A space answered its list, whole or in part. The records that pass replace the last known ones. */
     acceptSpaceList(spaceId, records, { complete }) {
-      const filtered = filterSpaceSessionRecords({ spaceId, records, isHostSessionId, claimedBy });
+      const filtered = filterSpaceSessionRecords({ spaceId, records, isHostSessionId, claimedBy, trusted });
       logDropped(spaceId, filtered.dropped);
       releaseClaims(spaceId);
       for (const record of filtered.records) claims.set(record.id, spaceId);
@@ -204,7 +208,7 @@ export function createSpaceSessionIndex({ logger = console } = {}) {
     },
     /** Whether one event of a space passes. A created session that passes is claimed for the space. */
     acceptSpaceEvent(spaceId, payload) {
-      const code = spaceEventDropCode({ spaceId, payload, isHostSessionId });
+      const code = spaceEventDropCode({ spaceId, payload, isHostSessionId, trusted });
       if (code !== null) {
         if (!(code === SPACE_DROP_CODES.eventOutsideRoot && isSpaceHomeEvent(payload))) {
           logger.warn?.(`[spaces] dropped an event of space ${spaceId}: ${code}`);
@@ -229,7 +233,7 @@ export function createSpaceSessionIndex({ logger = console } = {}) {
      * outside the space's root. Null when it may. Claims nothing.
      */
     spaceSessionDropCode(spaceId, sessionId, directory = null) {
-      if (directory !== null && (!directorySchema.safeParse(directory).success || !isDirectoryOfSpace(directory, spaceId))) return SPACE_DROP_CODES.eventOutsideRoot;
+      if (!trusted && directory !== null && (!directorySchema.safeParse(directory).success || !isDirectoryOfSpace(directory, spaceId))) return SPACE_DROP_CODES.eventOutsideRoot;
       if (!idSchema.safeParse(sessionId).success) return SPACE_DROP_CODES.malformed;
       if (isHostSessionId(sessionId)) return SPACE_DROP_CODES.eventHostSession;
       if ((claimedBy(sessionId) ?? spaceId) !== spaceId) return SPACE_DROP_CODES.claimed;
